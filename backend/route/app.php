@@ -23,6 +23,8 @@ Route::post('/api/users/:id/toggle-active', [UserController::class, 'toggleActiv
 Route::get('/api/inspection-items', [InspectionItemController::class, 'index'])->middleware(AuthMiddleware::class);
 // 记录查询需支持员工端通过 token 访问，因此不强制登录
 Route::get('/api/records', [RecordController::class, 'index']);
+// 单张保存（批量上传时逐张调用：某张失败不影响其它已保存图片）
+Route::post('/api/records/one', [RecordController::class, 'saveOne'])->middleware(AuthMiddleware::class);
 Route::post('/api/records', [RecordController::class, 'save'])->middleware(AuthMiddleware::class);
 Route::delete('/api/records/:id', [RecordController::class, 'delete'])->middleware(AuthMiddleware::class);
 Route::put('/api/records/:id/fix', [RecordController::class, 'uploadFix']);

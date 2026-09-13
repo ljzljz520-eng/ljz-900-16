@@ -2,7 +2,7 @@
   <div class="admin-page">
     <header class="page-header">
       <h1 class="page-title">检查上传</h1>
-      <p class="page-desc">选择员工、上传问题图片并关联检查项，key 序号连续、删除后自动重排，生成整改链接与二维码</p>
+      <p class="page-desc">选择员工，一次选择多张问题图片，逐张补检查项与扣分值后一起保存；逐张入库，失败会指出是第几张且不影响已保存图片，序号连续、自动生成整改链接与二维码</p>
     </header>
 
     <section v-loading="loading" class="admin-section">
@@ -85,38 +85,76 @@
             </div>
           </el-upload>
         </div>
-        <p class="card-hint">每张图片需选择对应检查项，保存后 key 自增连续、并生成整改链接与二维码</p>
+        <p class="card-hint">可一次选择多张图片；随后逐张选择检查项、填写扣分值，再一起保存。逐张入库，某张失败不影响其它已保存图片。</p>
       </div>
 
-      <!-- 待保存的新图片：显示临时 key #n -->
+      <!-- 待保存的新图片：逐张补检查项与扣分值，逐张保存，失败定位到具体图片 -->
       <div v-if="pendingItems.length" class="card">
         <div class="card-header">
           <span class="card-icon">
             <el-icon><List /></el-icon>
           </span>
-          <h2 class="card-title">为每张图片选择检查项（保存后序号为 #{{ nextKey }}～#{{ nextKey + pendingItems.length - 1 }}）</h2>
+          <h2 class="card-title">为每张图片补全检查项与扣分值（共 {{ pendingItems.length }} 张，保存后序号连续）</h2>
         </div>
+        <p class="card-hint-inline">
+          逐张选择检查项、填写扣分值后一起保存；保存成功的图片立即入库，某张失败或信息缺失时会标红并指出是第几张，已保存的图片不会受影响。
+        </p>
         <div class="pending-grid">
           <div
             v-for="(item, idx) in pendingItems"
             :key="item.uid"
+            :data-uid="item.uid"
             class="pending-item"
+            :class="{ 'is-error': !!item.error, 'is-saving': item.status === 'saving' }"
           >
-            <span class="pending-key-badge">#{{ nextKey + idx }}</span>
+            <span class="pending-key-badge">第 {{ idx + 1 }} 张</span>
             <div class="pending-preview">
               <img v-if="item.url" :src="item.url" alt="预览" />
+              <span v-if="item.status === 'saving'" class="pending-mask">
+                <el-icon class="is-loading"><Loading /></el-icon>保存中…
+              </span>
+              <span v-else-if="item.status === 'saved'" class="pending-mask success">
+                <el-icon><CircleCheckFilled /></el-icon>已保存
+              </span>
             </div>
-            <el-select v-model="item.itemId" placeholder="选择检查项" class="pending-select">
-              <el-option v-for="i in inspectionItems" :key="i.id" :label="`${i.name} (-${i.score}分)`" :value="i.id">
-                <span>{{ i.name }}</span>
-                <el-tag type="danger" size="small" class="ml-2">-{{ i.score }}分</el-tag>
-              </el-option>
-            </el-select>
+            <div class="pending-form">
+              <el-select
+                v-model="item.itemId"
+                placeholder="选择检查项"
+                class="pending-select"
+                :disabled="saving"
+                @change="onItemChange(item)"
+              >
+                <el-option v-for="i in inspectionItems" :key="i.id" :label="`${i.name} (-${i.score}分)`" :value="i.id">
+                  <span>{{ i.name }}</span>
+                  <el-tag type="danger" size="small" class="ml-2">-{{ i.score }}分</el-tag>
+                </el-option>
+              </el-select>
+              <div class="pending-score-wrap">
+                <span class="pending-score-label">扣分</span>
+                <el-input-number
+                  v-model="item.score"
+                  :min="0"
+                  :max="1000"
+                  :precision="0"
+                  :controls="false"
+                  placeholder="分值"
+                  class="pending-score"
+                  :disabled="saving"
+                  @input="onScoreInput(item)"
+                />
+                <span class="pending-score-unit">分</span>
+              </div>
+            </div>
+            <div v-if="item.error" class="pending-error">
+              <el-icon><WarningFilled /></el-icon>
+              <span>{{ item.error }}</span>
+            </div>
           </div>
         </div>
         <el-button type="primary" size="large" :loading="saving" class="save-btn" @click="saveRecords">
           <el-icon class="mr-2"><Check /></el-icon>
-          保存并生成链接与二维码
+          保存全部（{{ pendingItems.length }} 张）并生成链接与二维码
         </el-button>
       </div>
 
@@ -151,9 +189,20 @@
 </template>
 
 <script setup>
-import { ref, watch, computed, onMounted } from 'vue'
+import { ref, watch, onBeforeUnmount } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { UploadFilled, User, PictureFilled, List, Check, CircleCheckFilled, Picture, Delete } from '@element-plus/icons-vue'
+import {
+  UploadFilled,
+  User,
+  PictureFilled,
+  List,
+  Check,
+  CircleCheckFilled,
+  Picture,
+  Delete,
+  Loading,
+  WarningFilled,
+} from '@element-plus/icons-vue'
 import { api, apiBase } from '@/api/request'
 
 const loading = ref(false)
@@ -169,23 +218,50 @@ const resultQrUrl = ref('')
 const previewVisible = ref(false)
 const previewUrl = ref('')
 
-const nextKey = computed(() => {
-  if (existingRecords.value.length === 0) return 1
-  const max = Math.max(...existingRecords.value.map((r) => r.sequence_key))
-  return max + 1
-})
-
+// 每张待保存图片：{ uid, raw, url, itemId, score, scoreTouched, status, error }
 const pendingItems = ref([])
-function syncPendingItems() {
-  const prev = new Map(pendingItems.value.map((p) => [p.uid, p.itemId]))
-  pendingItems.value = fileList.value.map((f) => ({
-    uid: f.uid,
-    url: f.raw ? URL.createObjectURL(f.raw) : null,
-    itemId: prev.get(f.uid) ?? null,
-    raw: f.raw,
-  }))
+const objectUrls = new Map()
+
+function getObjectUrl(uid, raw) {
+  if (!raw) return null
+  if (objectUrls.has(uid)) return objectUrls.get(uid)
+  const url = URL.createObjectURL(raw)
+  objectUrls.set(uid, url)
+  return url
 }
-watch(fileList, syncPendingItems, { deep: true })
+
+function releaseObjectUrl(uid) {
+  const url = objectUrls.get(uid)
+  if (url) {
+    URL.revokeObjectURL(url)
+    objectUrls.delete(uid)
+  }
+}
+
+// 以 el-upload 的 fileList 为准同步待保存列表，保留已选检查项 / 扣分值 / 状态
+function syncPendingItems() {
+  const prev = new Map(pendingItems.value.map((p) => [p.uid, p]))
+  const next = fileList.value.map((f) => {
+    const old = prev.get(f.uid)
+    if (old) {
+      return { ...old, raw: f.raw || old.raw, url: getObjectUrl(f.uid, f.raw) || old.url }
+    }
+    return {
+      uid: f.uid,
+      raw: f.raw,
+      url: getObjectUrl(f.uid, f.raw),
+      itemId: null,
+      score: null,
+      scoreTouched: false,
+      status: 'idle', // idle | saving | saved
+      error: '',
+    }
+  })
+  for (const uid of objectUrls.keys()) {
+    if (!fileList.value.some((f) => f.uid === uid)) releaseObjectUrl(uid)
+  }
+  pendingItems.value = next
+}
 
 function formatDate(date) {
   if (!date) return ''
@@ -237,13 +313,30 @@ function imageUrl(path) {
 }
 
 function handlePreview(uploadFile) {
-  previewUrl.value = uploadFile.url || URL.createObjectURL(uploadFile.raw)
+  previewUrl.value = uploadFile.url || (uploadFile.raw ? getObjectUrl(uploadFile.uid, uploadFile.raw) : '')
   previewVisible.value = true
 }
 function onUploadChange(_uploadFile, uploadFiles) {
   fileList.value = uploadFiles
+  syncPendingItems()
 }
-function handleRemove() {}
+function handleRemove(_uploadFile, uploadFiles) {
+  fileList.value = uploadFiles
+  syncPendingItems()
+}
+
+// 选择检查项后自动带出标准扣分值（管理员手改过则不覆盖）
+function onItemChange(item) {
+  if (item.scoreTouched) return
+  const def = inspectionItems.value.find((i) => i.id === item.itemId)
+  item.score = def ? def.score : null
+  if (item.error) item.error = ''
+}
+// 一旦手动改过扣分值，就不再随检查项选择覆盖
+function onScoreInput(item) {
+  item.scoreTouched = true
+  if (item.error) item.error = ''
+}
 
 async function loadUsers() {
   loading.value = true
@@ -260,44 +353,98 @@ async function loadItems() {
   } catch (_) {}
 }
 
+function describeError(item) {
+  if (!item.itemId) return '请选择检查项'
+  if (item.score === null || item.score === undefined || Number.isNaN(item.score)) return '请填写扣分值'
+  if (!Number.isInteger(item.score)) return '扣分值必须是整数'
+  if (item.score < 0) return '扣分值不能为负'
+  return ''
+}
+
+function scrollToPending(uid) {
+  if (!uid) return
+  const el = document.querySelector(`.pending-item[data-uid="${uid}"]`)
+  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+}
+
 async function saveRecords() {
   if (!selectedUserId.value) {
     ElMessage.warning('请选择员工')
     return
   }
-  const invalid = pendingItems.value.find((p) => !p.itemId)
-  if (invalid) {
-    ElMessage.warning('请为每张图片选择检查项')
+  if (!pendingItems.value.length) return
+
+  // 保存前逐张校验，缺信息的直接标红并定位到第一张，不发起任何请求
+  let firstInvalidUid = null
+  for (const item of pendingItems.value) {
+    const msg = describeError(item)
+    item.error = msg
+    if (msg && !firstInvalidUid) firstInvalidUid = item.uid
+  }
+  if (firstInvalidUid) {
+    const idx = pendingItems.value.findIndex((p) => p.uid === firstInvalidUid) + 1
+    const bad = pendingItems.value[idx - 1]
+    ElMessage.warning(`第 ${idx} 张图片${bad.error}，请补全后再保存`)
+    scrollToPending(firstInvalidUid)
     return
   }
+
   saving.value = true
+  const checkDate = formatDate(selectedDate.value)
+  let okCount = 0
+  const failNames = []
   try {
-    const uploaded = []
+    // 逐张「上传图片 + 建记录」：某张失败只影响它自己，前面已保存的不会回滚
     for (const item of pendingItems.value) {
-      const res = await api.uploadImage(item.raw)
-      if (res?.path) uploaded.push({ item_id: item.itemId, issue_image: res.path })
+      const ordinal = pendingItems.value.findIndex((p) => p.uid === item.uid) + 1
+      item.status = 'saving'
+      item.error = ''
+      try {
+        const upRes = await api.uploadImage(item.raw, null, { skipErrorMessage: true })
+        if (!upRes?.path) throw new Error('图片上传失败')
+        await api.createRecord(
+          {
+            user_id: selectedUserId.value,
+            check_date: checkDate,
+            item_id: item.itemId,
+            score: item.score,
+            issue_image: upRes.path,
+          },
+          { skipErrorMessage: true }
+        )
+        item.status = 'saved'
+        okCount += 1
+      } catch (e) {
+        item.status = 'idle'
+        item.error = e?.response?.data?.message || e.message || '保存失败'
+        failNames.push(`第 ${ordinal} 张（${item.error}）`)
+      }
     }
-    const baseUrl = typeof window !== 'undefined' ? window.location.origin + '/fix' : 'http://localhost:3000/fix'
-    const saved = await api.createRecords({
-      user_id: selectedUserId.value,
-      check_date: formatDate(selectedDate.value),
-      items: uploaded,
-      base_url: baseUrl,
-    })
-    await loadRecords()
-    // 新后端：同一步返回二维码；旧后端：这里保底再走一次 generateQr
-    if (saved && typeof saved === 'object' && !Array.isArray(saved) && (saved.link || saved.qr_code_url)) {
-      resultLink.value = saved.link || ''
-      resultQrUrl.value = saved.qr_code_url || ''
+
+    // 已保存的立即落库并移出待存列表（连同 blob URL），失败的保留供修正后重试
+    const successUids = new Set(pendingItems.value.filter((p) => p.status === 'saved').map((p) => p.uid))
+    if (successUids.size) {
+      fileList.value = fileList.value.filter((f) => !successUids.has(f.uid))
+      syncPendingItems()
+      await loadRecords()
+
+      const baseUrl = typeof window !== 'undefined' ? window.location.origin + '/fix' : 'http://localhost:3000/fix'
+      try {
+        const qrData = await api.generateQr(selectedUserId.value, baseUrl)
+        resultLink.value = qrData?.link || ''
+        resultQrUrl.value = qrData?.qr_code_url || ''
+      } catch (_) {}
+    }
+
+    if (!failNames.length) {
+      ElMessage.success(`已保存 ${okCount} 张图片，并生成整改链接与二维码`)
+    } else if (okCount > 0) {
+      ElMessage.warning(`已保存 ${okCount} 张；以下图片保存失败且未丢失，补全后可重试：${failNames.join('；')}`)
+      scrollToPending(pendingItems.value[0]?.uid)
     } else {
-      const qrData = await api.generateQr(selectedUserId.value, baseUrl)
-      resultLink.value = qrData?.link || ''
-      resultQrUrl.value = qrData?.qr_code_url || ''
+      ElMessage.error(`全部 ${pendingItems.value.length} 张保存失败：${failNames.join('；')}`)
+      scrollToPending(pendingItems.value[0]?.uid)
     }
-    fileList.value = []
-    ElMessage.success('已保存并生成链接与二维码')
-  } catch (_) {
-    ElMessage.error('保存失败')
   } finally {
     saving.value = false
   }
@@ -308,8 +455,8 @@ function copyLink() {
   navigator.clipboard.writeText(resultLink.value).then(() => ElMessage.success('已复制到剪贴板'))
 }
 
-onMounted(() => {
-  syncPendingItems()
+onBeforeUnmount(() => {
+  for (const uid of Array.from(objectUrls.keys())) releaseObjectUrl(uid)
 })
 loadUsers()
 loadItems()
@@ -605,6 +752,7 @@ loadItems()
 }
 
 .pending-preview {
+  position: relative;
   aspect-ratio: 16/10;
   background: #e2e8f0;
   overflow: hidden;
@@ -616,9 +764,80 @@ loadItems()
   object-fit: cover;
 }
 
-.pending-select {
+.pending-form {
   padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.pending-select {
   width: 100%;
+}
+
+.pending-score-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pending-score-label {
+  font-size: 13px;
+  color: #475569;
+  flex-shrink: 0;
+}
+
+.pending-score {
+  flex: 1;
+  min-width: 0;
+}
+
+.pending-score-unit {
+  font-size: 13px;
+  color: #64748b;
+  flex-shrink: 0;
+}
+
+.pending-mask {
+  position: absolute;
+  inset: 0;
+  background: rgb(15 23 42 / 0.55);
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  z-index: 2;
+}
+
+.pending-mask.success {
+  background: rgb(16 185 129 / 0.72);
+}
+
+.pending-item.is-error {
+  border-color: #ef4444;
+  box-shadow: 0 0 0 2px rgb(239 68 68 / 0.15);
+}
+
+.pending-item.is-saving {
+  border-color: #0ea5e9;
+}
+
+.pending-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 0 12px 12px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: #dc2626;
+}
+
+.pending-error .el-icon {
+  margin-top: 1px;
+  flex-shrink: 0;
 }
 
 .save-btn {
