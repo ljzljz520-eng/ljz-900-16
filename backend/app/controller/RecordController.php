@@ -105,30 +105,61 @@ class RecordController
                 }
             }
 
+            // 先逐张校验：缺少检查项/图片、检查项不存在、扣分值非法时，明确指出是第几张
+            foreach ($items as $i => $item) {
+                $seq = $i + 1;
+                $itemId = (int) ($item['item_id'] ?? 0);
+                $issueImage = trim((string) ($item['issue_image'] ?? ''));
+                if (!$itemId) {
+                    return api_json(['code' => 400, 'message' => "第 {$seq} 张图片未选择检查项", 'data' => null]);
+                }
+                if ($issueImage === '') {
+                    return api_json(['code' => 400, 'message' => "第 {$seq} 张图片缺少图片文件", 'data' => null]);
+                }
+                if (!isset($itemMap[$itemId])) {
+                    return api_json(['code' => 400, 'message' => "第 {$seq} 张图片选择的检查项不存在，请重新选择", 'data' => null]);
+                }
+                // 扣分值：允许逐张覆盖检查项默认分；默认取检查项分值
+                if (array_key_exists('score', $item) && $item['score'] !== null && $item['score'] !== '') {
+                    $scoreVal = $item['score'];
+                    if (!is_numeric($scoreVal) || (float) $scoreVal < 0 || (float) $scoreVal > 100
+                        || floor((float) $scoreVal) !== (float) $scoreVal) {
+                        return api_json(['code' => 400, 'message' => "第 {$seq} 张图片的扣分值无效（需为 0～100 的整数）", 'data' => null]);
+                    }
+                }
+            }
+
             $created = [];
             foreach ($items as $i => $item) {
                 $itemId = (int) ($item['item_id'] ?? 0);
                 $issueImage = (string) ($item['issue_image'] ?? '');
-                if (!$itemId || !$issueImage) {
-                    continue;
+                $snapName = (string) $itemMap[$itemId]->name;
+                $snapScore = (int) $itemMap[$itemId]->score;
+                if (array_key_exists('score', $item) && $item['score'] !== null && $item['score'] !== '') {
+                    $snapScore = (int) $item['score'];
                 }
-                $snapName = null;
-                $snapScore = null;
-                if (isset($itemMap[$itemId])) {
-                    $snapName = (string) $itemMap[$itemId]->name;
-                    $snapScore = (int) $itemMap[$itemId]->score;
+                try {
+                    $record = Record::create([
+                        'user_id'      => $userId,
+                        'item_id'      => $itemId,
+                        'item_name_snapshot'  => $snapName,
+                        'item_score_snapshot' => $snapScore,
+                        'sequence_key' => $startKey + $i,
+                        'issue_image'  => $issueImage,
+                        'status'       => 'pending',
+                        'check_date'   => $checkDate,
+                    ]);
+                    $created[] = Record::with(['item'])->find($record->id)->toArray();
+                } catch (\Throwable $e) {
+                    // 前面已经保存的图片保留，明确报告是第几张失败
+                    Log::error('RecordController@save item failed at ' . ($i + 1) . ': ' . $e->getMessage());
+                    $hint = $i > 0 ? '（前面 ' . $i . ' 张已保存，不会丢失）' : '';
+                    return api_json([
+                        'code' => 500,
+                        'message' => '第 ' . ($i + 1) . ' 张图片保存失败' . $hint . '，该张及其后图片未保存',
+                        'data' => ['saved_count' => count($created)],
+                    ]);
                 }
-                $record = Record::create([
-                    'user_id'      => $userId,
-                    'item_id'      => $itemId,
-                    'item_name_snapshot'  => $snapName,
-                    'item_score_snapshot' => $snapScore,
-                    'sequence_key' => $startKey + $i,
-                    'issue_image'  => $issueImage,
-                    'status'       => 'pending',
-                    'check_date'   => $checkDate,
-                ]);
-                $created[] = Record::with(['item'])->find($record->id)->toArray();
             }
 
             // 可选：同一步生成“带 token 链接 + 唯一二维码”
