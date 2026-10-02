@@ -77,7 +77,7 @@ class RecordController
     {
         try {
             $userId = (int) Request::param('user_id');
-            $items = Request::param('items'); // [{ item_id, issue_image }]
+            $items = Request::param('items'); // [{ item_id, issue_image, score? }]
             $baseUrl = trim((string) Request::param('base_url', ''));
             if (!$userId || !is_array($items) || empty($items)) {
                 return api_json(['code' => 400, 'message' => '参数错误', 'data' => null]);
@@ -105,18 +105,34 @@ class RecordController
                 }
             }
 
+            // 先逐张校验：哪一张缺信息直接在报错中指明，且校验不通过时不写入任何记录
+            foreach ($items as $i => $item) {
+                $pos = $i + 1;
+                $itemId = (int) ($item['item_id'] ?? 0);
+                $issueImage = (string) ($item['issue_image'] ?? '');
+                if (!$itemId || !$issueImage) {
+                    return api_json(['code' => 400, 'message' => "第 {$pos} 张图片缺少检查项或图片信息", 'data' => null]);
+                }
+                if (!isset($itemMap[$itemId])) {
+                    return api_json(['code' => 400, 'message' => "第 {$pos} 张图片的检查项不存在，请重新选择", 'data' => null]);
+                }
+                $score = $item['score'] ?? null;
+                if ($score !== null && $score !== '' && !is_numeric($score)) {
+                    return api_json(['code' => 400, 'message' => "第 {$pos} 张图片的扣分值无效", 'data' => null]);
+                }
+            }
+
+            // 逐张写入（刻意不用事务）：若运行期中途失败，已保存的记录保留不回滚
             $created = [];
             foreach ($items as $i => $item) {
                 $itemId = (int) ($item['item_id'] ?? 0);
                 $issueImage = (string) ($item['issue_image'] ?? '');
-                if (!$itemId || !$issueImage) {
-                    continue;
-                }
-                $snapName = null;
-                $snapScore = null;
-                if (isset($itemMap[$itemId])) {
-                    $snapName = (string) $itemMap[$itemId]->name;
-                    $snapScore = (int) $itemMap[$itemId]->score;
+                $snapName = (string) $itemMap[$itemId]->name;
+                $snapScore = (int) $itemMap[$itemId]->score;
+                // 管理员可逐张覆盖扣分值，覆盖值写入快照
+                $score = $item['score'] ?? null;
+                if ($score !== null && $score !== '') {
+                    $snapScore = max(0, (int) $score);
                 }
                 $record = Record::create([
                     'user_id'      => $userId,
